@@ -22,11 +22,26 @@ if [ ! -d "$CD" ]; then
   git clone --depth=1 https://github.com/comfyanonymous/ComfyUI "$CD" && pip install -q -r "$CD/requirements.txt" || echo "[boot] WARN ComfyUI install issue"
 fi
 
-# --- one-time provisioning: custom nodes + base models (MINIMAL=1 skips it for fast boot) ---
+# --- base models: download whenever a URL is set (idempotent; needed for generation even in MINIMAL) ---
+M="$CD/models"
+mkdir -p "$M"/{checkpoints,vae,loras,controlnet,upscale_models,diffusion_models,text_encoders,clip_vision,instantid,pulid}
+dl() {
+  [ -z "${1:-}" ] && return 0
+  [ -f "$2" ] && return 0
+  echo "[boot] downloading $(basename "$2")"
+  if [ -n "${HF_TOKEN:-}" ]; then wget -q --header="Authorization: Bearer ${HF_TOKEN}" -O "$2" "$1" || { echo "[boot] WARN dl failed $2"; rm -f "$2"; }
+  else wget -q -O "$2" "$1" || { echo "[boot] WARN dl failed $2"; rm -f "$2"; }; fi
+}
+dl "${SDXL_CKPT_URL:-}"    "$M/checkpoints/sdxl-base.safetensors"
+dl "${FLUX_DEV_FP8_URL:-}" "$M/diffusion_models/flux1-dev-fp8.safetensors"
+dl "${FLUX_VAE_URL:-}"     "$M/vae/ae.safetensors"
+dl "${T5XXL_URL:-}"        "$M/text_encoders/t5xxl_fp16.safetensors"
+dl "${CLIP_L_URL:-}"       "$M/text_encoders/clip_l.safetensors"
+
+# --- custom nodes: only on a full boot (MINIMAL=1 skips; heavy clones + pip for Phase 4/5) ---
 if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.provisioned" ]; then
-  echo "[boot] provisioning custom nodes + models (first boot — may take 5–30 min)"
-  CN="$CD/custom_nodes"; M="$CD/models"
-  mkdir -p "$CN" "$M"/{checkpoints,vae,loras,controlnet,upscale_models,diffusion_models,text_encoders,clip_vision,instantid,pulid}
+  echo "[boot] provisioning custom nodes (first full boot — may take 5–20 min)"
+  CN="$CD/custom_nodes"; mkdir -p "$CN"
   clone() { d="$CN/$(basename "$1")"; [ -d "$d" ] || git clone --depth=1 "$1" "$d"; [ -f "$d/requirements.txt" ] && pip install -q -r "$d/requirements.txt" || true; }
   clone https://github.com/ltdrdata/ComfyUI-Manager
   clone https://github.com/ltdrdata/ComfyUI-Impact-Pack
@@ -38,12 +53,6 @@ if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.provisioned" ]; then
   clone https://github.com/kijai/ComfyUI-FluxTrainer
   clone https://github.com/ssitu/ComfyUI_UltimateSDUpscale
   clone https://github.com/kijai/ComfyUI-WanVideoWrapper
-  dl() { [ -z "${1:-}" ] && return 0; [ -f "$2" ] && return 0; echo "[boot] dl $(basename "$2")"; wget -q --header="Authorization: Bearer ${HF_TOKEN:-}" -O "$2" "$1" || echo "[boot] WARN download failed: $2"; }
-  dl "${SDXL_CKPT_URL:-}"    "$M/checkpoints/sdxl-base.safetensors"
-  dl "${FLUX_DEV_FP8_URL:-}" "$M/diffusion_models/flux1-dev-fp8.safetensors"
-  dl "${FLUX_VAE_URL:-}"     "$M/vae/ae.safetensors"
-  dl "${T5XXL_URL:-}"        "$M/text_encoders/t5xxl_fp16.safetensors"
-  dl "${CLIP_L_URL:-}"       "$M/text_encoders/clip_l.safetensors"
   touch "$WS/.provisioned"
 fi
 
