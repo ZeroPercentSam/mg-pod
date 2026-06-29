@@ -1,0 +1,41 @@
+# → mg-pod/.github/workflows/build.yml. Builds the baked pod image and pushes to GHCR.
+# After the first successful run, make the package PUBLIC (GitHub → Packages → mg-pod → Package settings →
+# Change visibility → Public) so RunPod can pull without registry creds. The image holds no secrets.
+name: build-pod-image
+on:
+  push:
+    branches: [main]
+    paths: [Dockerfile, authproxy.py, entrypoint.sh, .github/workflows/build.yml]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # The image is large (CUDA base + torch×2); reclaim ~25GB on the runner before building.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -af || true
+          df -h
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ghcr.io/zeropercentsam/mg-pod:latest
+          provenance: false
