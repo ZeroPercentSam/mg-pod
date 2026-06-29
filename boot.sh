@@ -69,7 +69,13 @@ if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.trainer_provisioned" ]; then
   "$WS/kohya-venv/bin/pip" install -q --upgrade pip
   "$WS/kohya-venv/bin/pip" install -q -r "$WS/sd-scripts/requirements.txt" || echo "[boot] WARN kohya reqs"
   "$WS/kohya-venv/bin/pip" install -q accelerate bitsandbytes xformers || echo "[boot] WARN kohya extras"
-  touch "$WS/.trainer_provisioned"
+  # Only mark provisioned if the trainer is actually usable — else retry on the next boot instead of
+  # marking a half-built venv "done" and failing every train with a buried ImportError.
+  if [ -x "$WS/kohya-venv/bin/accelerate" ] && [ -f "$WS/sd-scripts/sdxl_train_network.py" ]; then
+    touch "$WS/.trainer_provisioned"
+  else
+    echo "[boot] WARN trainer NOT fully provisioned — will retry next boot"
+  fi
 fi
 
 # --- auth-proxy: :8188 (Bearer-gated) → ComfyUI :8189, plus a local /train endpoint (kohya) ---
@@ -98,6 +104,15 @@ def _load_jobs():
     try:
         with open(JOBS_FILE) as f: jobs = json.load(f)
     except Exception: jobs = {}
+    # No worker thread survives a pod restart, so any job still marked in-flight is orphaned. Fail it,
+    # else the 409 busy-check would reject every future /train forever (and the app would poll it forever).
+    changed = False
+    for v in jobs.values():
+        if v.get("status") in ("queued", "downloading", "training"):
+            v["status"], v["error"] = "error", "pod restarted mid-training"
+            changed = True
+    if changed:
+        _save_jobs()
 
 def _save_jobs():
     try:
@@ -113,6 +128,9 @@ def _set(job_id, **kw):
         _save_jobs()
 
 def _download(url, dest):
+    # http(s) only — block file:// (local-file read) and other schemes from the job spec.
+    if not url.lower().startswith(("http://", "https://")):
+        raise ValueError(f"refusing non-http(s) dataset url: {url[:48]}")
     req = urllib.request.Request(url, headers={"User-Agent": "mg-pod"})
     with urllib.request.urlopen(req, timeout=180) as r, open(dest, "wb") as f:
         shutil.copyfileobj(r, f)
@@ -120,11 +138,15 @@ def _download(url, dest):
 def _run_training(job_id, spec):
     try:
         token = (spec.get("instance_token") or "ohwx woman").strip()
-        out_name = spec["output_name"]
-        steps = int(spec.get("steps", 1200))
-        dim = int(spec.get("network_dim", 32))
-        alpha = int(spec.get("network_alpha", 16))
-        repeats = int(spec.get("repeats", 10))
+        # output_name becomes a file path + kohya --output_name → strip anything that could escape LORA_DIR
+        out_name = re.sub(r"[^A-Za-z0-9_-]", "", spec.get("output_name", ""))
+        if not out_name:
+            return _set(job_id, status="error", error="invalid or missing output_name")
+        # `or default` (not get(k, default)) so an explicit null from the app doesn't reach int(None)
+        steps = int(spec.get("steps") or 1200)
+        dim = int(spec.get("network_dim") or 32)
+        alpha = int(spec.get("network_alpha") or 16)
+        repeats = int(spec.get("repeats") or 10)
         images = spec["images"]
         captions = spec.get("captions") or []
         # token is free-text from the app's trigger-word field → sanitize before it becomes a path component
@@ -198,7 +220,10 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.path.startswith("/train/status"): return self._train_status()
         return self._proxy("GET")
     def do_POST(self):
-        if not self._auth(): return self._send(401, b"unauthorized")
+        if not self._auth():
+            n = int(self.headers.get("Content-Length") or 0)
+            if n: self.rfile.read(n)  # drain body so the HTTP/1.1 keep-alive connection stays in sync
+            return self._send(401, b"unauthorized")
         if self.path == "/train": return self._start_train()
         return self._proxy("POST")
     def do_DELETE(self):
@@ -210,6 +235,8 @@ class H(http.server.BaseHTTPRequestHandler):
         except Exception as e: return self._json(400, {"error": f"bad json: {e}"})
         if not spec.get("images") or not spec.get("output_name"):
             return self._json(400, {"error": "images[] and output_name required"})
+        if not os.path.exists(ACCEL):
+            return self._json(503, {"error": "trainer not provisioned on this pod (boot with COMFY_MINIMAL unset, then restart)"})
         job_id = spec.get("job_id") or f"job-{int(time.time())}"
         with jobs_lock:
             busy = [j for j, v in jobs.items() if v.get("status") in ("queued", "downloading", "training")]
@@ -220,8 +247,18 @@ class H(http.server.BaseHTTPRequestHandler):
         return self._json(200, {"job_id": job_id, "status": "queued"})
     def _train_status(self):
         job_id = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
-        with jobs_lock: st = jobs.get(job_id)
+        with jobs_lock: st = dict(jobs.get(job_id) or {})
         if not st: return self._json(404, {"status": "unknown", "error": "unknown job (pod may have been recreated)"})
+        # While training, kohya's tqdm writes "<pct>%" to the log — surface the latest so the bar moves
+        # instead of sitting at the single value set when the run started.
+        if st.get("status") == "training":
+            try:
+                with open(f"{WS}/train/{job_id}/train.log", "rb") as f:
+                    f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 4096))
+                    tail = f.read().decode("utf-8", "ignore")
+                pcts = re.findall(r"(\d{1,3})%", tail)
+                if pcts: st["progress"] = max(5, min(99, int(pcts[-1])))
+            except Exception: pass
         return self._json(200, st)
     def _proxy(self, method):
         n = int(self.headers.get("Content-Length") or 0)
