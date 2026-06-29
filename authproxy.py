@@ -53,6 +53,28 @@ def _download(url, dest):
     with urllib.request.urlopen(req, timeout=180) as r, open(dest, "wb") as f:
         shutil.copyfileobj(r, f)
 
+# ComfyUI + kohya share ONE GPU. ComfyUI caches model weights in VRAM after gens (and /free leaves
+# a large CUDA-context residual), which OOMs the trainer. So we fully stop ComfyUI for the training's
+# duration to hand it the whole card, then bring it back. PID1 (entrypoint) waits only on the proxy,
+# so killing ComfyUI here does NOT end the container.
+COMFY_ARGS = ["python3", "main.py", "--listen", "127.0.0.1", "--port", "8189"]
+def _comfy_up():
+    try:
+        urllib.request.urlopen(UP + "/system_stats", timeout=5).read(); return True
+    except Exception:
+        return False
+def _stop_comfy():
+    subprocess.run(["pkill", "-9", "-f", "main.py --listen 127.0.0.1 --port 8189"])
+    for _ in range(20):
+        if not _comfy_up(): return
+        time.sleep(1)
+def _start_comfy():
+    subprocess.Popen(COMFY_ARGS, cwd="/opt/ComfyUI", stdout=open("/comfy.log", "a"), stderr=subprocess.STDOUT)
+    for _ in range(60):  # ~2min for ComfyUI to reload + be reachable again
+        if _comfy_up(): return True
+        time.sleep(2)
+    return False
+
 def _run_training(job_id, spec):
     try:
         token = (spec.get("instance_token") or "ohwx woman").strip()
@@ -83,6 +105,7 @@ def _run_training(job_id, spec):
         if not os.path.exists(SDXL):
             return _set(job_id, status="error", error=f"SDXL base not on volume ({SDXL}); set SDXL_CKPT_URL")
         _set(job_id, status="training", progress=5)
+        _stop_comfy()  # free the whole GPU for kohya (shared card); ComfyUI restarts after, see finally
         log_path = f"{root}/train.log"
         cmd = [
             ACCEL, "launch", "--num_processes=1", "--num_machines=1",
@@ -104,8 +127,12 @@ def _run_training(job_id, spec):
             "--save_model_as=safetensors", "--caption_extension=.txt",
             "--seed=42", "--no_half_vae", "--sdpa",
         ]
-        with open(log_path, "w") as lf:
-            p = subprocess.run(cmd, cwd=KOHYA, stdout=lf, stderr=subprocess.STDOUT)
+        env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}  # less fragmentation
+        try:
+            with open(log_path, "w") as lf:
+                p = subprocess.run(cmd, cwd=KOHYA, stdout=lf, stderr=subprocess.STDOUT, env=env)
+        finally:
+            _start_comfy()  # bring ComfyUI back so generations work again post-training
         out_file = f"{LORA_DIR}/{out_name}.safetensors"
         if p.returncode == 0 and os.path.exists(out_file):
             _set(job_id, status="done", progress=100, output=f"{out_name}.safetensors", size=os.path.getsize(out_file))

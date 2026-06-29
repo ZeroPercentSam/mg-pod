@@ -30,7 +30,9 @@ dl "${CLIP_L_URL:-}"    "$MODELS/text_encoders/clip_l.safetensors"
 dl "${LTXV_CKPT_URL:-}" "$MODELS/checkpoints/ltx-video.safetensors"
 
 python3 /opt/authproxy.py &
+PROXY=$!
 echo "[boot] auth-proxy up on :8188"
 cd "$CD" && python3 main.py --listen 127.0.0.1 --port 8189 >/comfy.log 2>&1 &
 echo "[boot] ComfyUI starting; ready once /system_stats returns 200"
-wait
+# Wait ONLY on the proxy so the trainer can stop/restart ComfyUI (to free VRAM) without ending PID1.
+wait "$PROXY"

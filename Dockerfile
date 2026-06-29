@@ -10,7 +10,7 @@ FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 SHELL ["/bin/bash", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive PIP_NO_CACHE_DIR=1
 
-RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg wget && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg wget procps && rm -rf /var/lib/apt/lists/*
 
 # ComfyUI (deps into the base python = base CUDA torch 2.4.1) at /opt (NOT /workspace — volume shadows it)
 RUN git clone --depth=1 https://github.com/comfyanonymous/ComfyUI /opt/ComfyUI \
