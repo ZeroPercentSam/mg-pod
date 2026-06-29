@@ -37,6 +37,7 @@ dl "${FLUX_DEV_FP8_URL:-}" "$M/diffusion_models/flux1-dev-fp8.safetensors"
 dl "${FLUX_VAE_URL:-}"     "$M/vae/ae.safetensors"
 dl "${T5XXL_URL:-}"        "$M/text_encoders/t5xxl_fp16.safetensors"
 dl "${CLIP_L_URL:-}"       "$M/text_encoders/clip_l.safetensors"
+dl "${LTXV_CKPT_URL:-}"    "$M/checkpoints/ltx-video.safetensors"   # Phase 5 img2vid (needs T5XXL_URL too)
 
 # --- custom nodes: only on a full boot (MINIMAL=1 skips; heavy clones + pip for Phase 4/5) ---
 if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.provisioned" ]; then
@@ -53,6 +54,7 @@ if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.provisioned" ]; then
   clone https://github.com/kijai/ComfyUI-FluxTrainer
   clone https://github.com/ssitu/ComfyUI_UltimateSDUpscale
   clone https://github.com/kijai/ComfyUI-WanVideoWrapper
+  clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite   # VHS_VideoCombine → mp4 (Phase 5)
   touch "$WS/.provisioned"
 fi
 
