@@ -13,6 +13,8 @@
 : "${COMFYUI_TOKEN:?COMFYUI_TOKEN required}"
 WS=/workspace
 CD="$WS/ComfyUI"
+mkdir -p "$WS"
+exec > >(tee -a "$WS/boot.log") 2>&1   # persist boot trace to the volume → readable post-mortem via /boot-log
 
 echo "[boot] tools"
 command -v git >/dev/null 2>&1 || (apt-get update -y && apt-get install -y --no-install-recommends git) >/dev/null 2>&1 || true
@@ -20,8 +22,11 @@ command -v git >/dev/null 2>&1 || (apt-get update -y && apt-get install -y --no-
 # --- ComfyUI on the volume (persists across restarts) ---
 if [ ! -d "$CD" ]; then
   echo "[boot] cloning ComfyUI"
-  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI "$CD" && pip install -q -r "$CD/requirements.txt" || echo "[boot] WARN ComfyUI install issue"
+  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI "$CD" || echo "[boot] WARN ComfyUI clone"
 fi
+# Ensure deps every boot (cheap if satisfied) — the clone may have happened on a prior boot. python3
+# explicitly: this image ships python3 but bare `python` is not on PATH in the boot context.
+python3 -m pip install -q -r "$CD/requirements.txt" || echo "[boot] WARN ComfyUI deps"
 
 # --- base models: download whenever a URL is set (idempotent; needed for generation even in MINIMAL) ---
 M="$CD/models"
@@ -44,7 +49,7 @@ dl "${LTXV_CKPT_URL:-}"    "$M/checkpoints/ltx-video.safetensors"   # Phase 5 im
 if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.provisioned" ]; then
   echo "[boot] provisioning custom nodes (first full boot — may take 5–20 min)"
   CN="$CD/custom_nodes"; mkdir -p "$CN"
-  clone() { d="$CN/$(basename "$1")"; [ -d "$d" ] || git clone --depth=1 "$1" "$d"; [ -f "$d/requirements.txt" ] && pip install -q -r "$d/requirements.txt" || true; }
+  clone() { d="$CN/$(basename "$1")"; [ -d "$d" ] || git clone --depth=1 "$1" "$d"; [ -f "$d/requirements.txt" ] && python3 -m pip install -q -r "$d/requirements.txt" || true; }
   clone https://github.com/ltdrdata/ComfyUI-Manager
   clone https://github.com/ltdrdata/ComfyUI-Impact-Pack
   clone https://github.com/cubiq/ComfyUI_IPAdapter_plus
@@ -61,21 +66,17 @@ fi
 
 # --- kohya sd-scripts for SDXL LoRA training (full boot only; venv isolates kohya's pinned deps
 #     from ComfyUI's env so neither breaks the other). Persists on the volume → one-time cost. ---
-if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.trainer_provisioned" ]; then
+# Sentinel is the accelerate binary itself (not a flag file): if it's missing the install failed/never
+# ran, so retry. python3 explicitly — bare `python` is not on PATH here, which silently broke venv before.
+if [ "${MINIMAL:-0}" != "1" ] && [ ! -x "$WS/kohya-venv/bin/accelerate" ]; then
   echo "[boot] provisioning kohya sd-scripts (LoRA trainer — may take a few min)"
   [ -d "$WS/sd-scripts" ] || git clone --depth=1 https://github.com/kohya-ss/sd-scripts "$WS/sd-scripts"
   # --system-site-packages reuses the base CUDA torch (kohya reqs don't pin torch) → avoids a 2GB reinstall.
-  python -m venv --system-site-packages "$WS/kohya-venv"
-  "$WS/kohya-venv/bin/pip" install -q --upgrade pip
-  "$WS/kohya-venv/bin/pip" install -q -r "$WS/sd-scripts/requirements.txt" || echo "[boot] WARN kohya reqs"
-  "$WS/kohya-venv/bin/pip" install -q accelerate bitsandbytes xformers || echo "[boot] WARN kohya extras"
-  # Only mark provisioned if the trainer is actually usable — else retry on the next boot instead of
-  # marking a half-built venv "done" and failing every train with a buried ImportError.
-  if [ -x "$WS/kohya-venv/bin/accelerate" ] && [ -f "$WS/sd-scripts/sdxl_train_network.py" ]; then
-    touch "$WS/.trainer_provisioned"
-  else
-    echo "[boot] WARN trainer NOT fully provisioned — will retry next boot"
-  fi
+  python3 -m venv --system-site-packages "$WS/kohya-venv" || echo "[boot] WARN venv create failed"
+  "$WS/kohya-venv/bin/pip" install --upgrade pip
+  "$WS/kohya-venv/bin/pip" install -r "$WS/sd-scripts/requirements.txt" || echo "[boot] WARN kohya reqs"
+  "$WS/kohya-venv/bin/pip" install accelerate bitsandbytes xformers || echo "[boot] WARN kohya extras"
+  [ -x "$WS/kohya-venv/bin/accelerate" ] && echo "[boot] kohya OK" || echo "[boot] WARN kohya accelerate STILL missing"
 fi
 
 # --- auth-proxy: :8188 (Bearer-gated) → ComfyUI :8189, plus a local /train endpoint (kohya) ---
@@ -218,6 +219,7 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._auth(): return self._send(401, b"unauthorized")
         if self.path.startswith("/train/status"): return self._train_status()
+        if self.path.startswith("/boot-log"): return self._boot_log()
         return self._proxy("GET")
     def do_POST(self):
         if not self._auth():
@@ -260,6 +262,17 @@ class H(http.server.BaseHTTPRequestHandler):
                 if pcts: st["progress"] = max(5, min(99, int(pcts[-1])))
             except Exception: pass
         return self._json(200, st)
+    def _boot_log(self):
+        out = {}
+        for name, path in (("boot", f"{WS}/boot.log"), ("comfy", "/comfy.log")):
+            try:
+                with open(path, "rb") as f:
+                    f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 8000))
+                    out[name] = f.read().decode("utf-8", "ignore")
+            except Exception as e:
+                out[name] = f"(no {path}: {e})"
+        return self._json(200, out)
+
     def _proxy(self, method):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else None
@@ -284,7 +297,7 @@ http.server.ThreadingHTTPServer(("0.0.0.0", 8188), H).serve_forever()
 PY
 
 echo "[boot] starting ComfyUI (127.0.0.1:8189)"
-cd "$CD" && python main.py --listen 127.0.0.1 --port 8189 >/comfy.log 2>&1 &
+cd "$CD" && python3 main.py --listen 127.0.0.1 --port 8189 >/comfy.log 2>&1 &
 for _ in $(seq 1 150); do curl -sf "http://127.0.0.1:8189/system_stats" >/dev/null 2>&1 && break; sleep 2; done
 echo "[boot] starting auth-proxy on :8188"
 exec python3 /authproxy.py
