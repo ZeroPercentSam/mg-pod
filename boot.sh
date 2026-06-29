@@ -45,10 +45,19 @@ dl "${T5XXL_URL:-}"        "$M/text_encoders/t5xxl_fp16.safetensors"
 dl "${CLIP_L_URL:-}"       "$M/text_encoders/clip_l.safetensors"
 dl "${LTXV_CKPT_URL:-}"    "$M/checkpoints/ltx-video.safetensors"   # Phase 5 img2vid (needs T5XXL_URL too)
 
-# --- custom nodes: only on a full boot (MINIMAL=1 skips; heavy clones + pip for Phase 4/5) ---
+CN="$CD/custom_nodes"; mkdir -p "$CN"
+# --- VideoHelperSuite: the ONLY custom node a built-in template needs (VHS_VideoCombine → mp4 for
+#     ltx-img2vid). Clone + ENSURE deps EVERY boot (python3 + ffmpeg) — a prior boot's broken bare-pip
+#     can leave node deps uninstalled, and the optional-node flag below would otherwise skip reinstall. ---
+VHS="$CN/ComfyUI-VideoHelperSuite"
+[ -d "$VHS" ] || git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite "$VHS"
+command -v ffmpeg >/dev/null 2>&1 || (apt-get update -y && apt-get install -y --no-install-recommends ffmpeg) >/dev/null 2>&1 || echo "[boot] WARN ffmpeg"
+[ -f "$VHS/requirements.txt" ] && python3 -m pip install -q -r "$VHS/requirements.txt" || true
+
+# --- optional heavy nodes (face-swap / controlnet / upscale / etc.): first full boot only. Not used by
+#     any current template, so their import failures are harmless noise — kept for future work. ---
 if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.provisioned" ]; then
-  echo "[boot] provisioning custom nodes (first full boot — may take 5–20 min)"
-  CN="$CD/custom_nodes"; mkdir -p "$CN"
+  echo "[boot] provisioning optional custom nodes (first full boot — may take 5–20 min)"
   clone() { d="$CN/$(basename "$1")"; [ -d "$d" ] || git clone --depth=1 "$1" "$d"; [ -f "$d/requirements.txt" ] && python3 -m pip install -q -r "$d/requirements.txt" || true; }
   clone https://github.com/ltdrdata/ComfyUI-Manager
   clone https://github.com/ltdrdata/ComfyUI-Impact-Pack
@@ -60,23 +69,31 @@ if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.provisioned" ]; then
   clone https://github.com/kijai/ComfyUI-FluxTrainer
   clone https://github.com/ssitu/ComfyUI_UltimateSDUpscale
   clone https://github.com/kijai/ComfyUI-WanVideoWrapper
-  clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite   # VHS_VideoCombine → mp4 (Phase 5)
   touch "$WS/.provisioned"
 fi
 
 # --- kohya sd-scripts for SDXL LoRA training (full boot only; venv isolates kohya's pinned deps
 #     from ComfyUI's env so neither breaks the other). Persists on the volume → one-time cost. ---
-# Sentinel is the accelerate binary itself (not a flag file): if it's missing the install failed/never
-# ran, so retry. python3 explicitly — bare `python` is not on PATH here, which silently broke venv before.
-if [ "${MINIMAL:-0}" != "1" ] && [ ! -x "$WS/kohya-venv/bin/accelerate" ]; then
-  echo "[boot] provisioning kohya sd-scripts (LoRA trainer — may take a few min)"
+# CLEAN, self-contained venv (NOT --system-site-packages): the system-site hybrid made the venv load
+# the base transformers against a mismatched torch → "Could not import CLIPTextModel". A clean venv with
+# a pinned torch (cu124, matching the image) installs a consistent transformers/diffusers set. Sentinel
+# .kohya-v2 forces a one-time rebuild over any earlier broken venv (which still has an accelerate binary).
+if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.kohya-v2" ]; then
+  echo "[boot] provisioning kohya sd-scripts (clean venv v2 — downloads torch, a few min)"
   [ -d "$WS/sd-scripts" ] || git clone --depth=1 https://github.com/kohya-ss/sd-scripts "$WS/sd-scripts"
-  # --system-site-packages reuses the base CUDA torch (kohya reqs don't pin torch) → avoids a 2GB reinstall.
-  python3 -m venv --system-site-packages "$WS/kohya-venv" || echo "[boot] WARN venv create failed"
-  "$WS/kohya-venv/bin/pip" install --upgrade pip
-  "$WS/kohya-venv/bin/pip" install -r "$WS/sd-scripts/requirements.txt" || echo "[boot] WARN kohya reqs"
-  "$WS/kohya-venv/bin/pip" install accelerate bitsandbytes xformers || echo "[boot] WARN kohya extras"
-  [ -x "$WS/kohya-venv/bin/accelerate" ] && echo "[boot] kohya OK" || echo "[boot] WARN kohya accelerate STILL missing"
+  rm -rf "$WS/kohya-venv"
+  python3 -m venv "$WS/kohya-venv" || echo "[boot] WARN venv create failed"
+  PIP="$WS/kohya-venv/bin/pip"
+  "$PIP" install --upgrade pip
+  "$PIP" install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124 || echo "[boot] WARN torch"
+  "$PIP" install -r "$WS/sd-scripts/requirements.txt" || echo "[boot] WARN kohya reqs"
+  "$PIP" install accelerate || echo "[boot] WARN accelerate"
+  # Smoke-test the exact import that failed before; only flag provisioned if it passes (else retry).
+  if "$WS/kohya-venv/bin/python" -c "import torch; from transformers import CLIPTextModel" 2>>"$WS/boot.log"; then
+    echo "[boot] kohya env OK"; touch "$WS/.kohya-v2"
+  else
+    echo "[boot] WARN kohya env import FAILED — will retry next boot"
+  fi
 fi
 
 # --- auth-proxy: :8188 (Bearer-gated) → ComfyUI :8189, plus a local /train endpoint (kohya) ---
@@ -184,11 +201,11 @@ def _run_training(job_id, spec):
             "--train_batch_size=1",
             f"--max_train_steps={steps}",
             "--learning_rate=1e-4", "--unet_lr=1e-4", "--text_encoder_lr=5e-5",
-            "--optimizer_type=AdamW8bit", "--lr_scheduler=cosine",
+            "--optimizer_type=AdamW", "--lr_scheduler=cosine",
             "--mixed_precision=fp16", "--save_precision=fp16",
             "--cache_latents", "--gradient_checkpointing",
             "--save_model_as=safetensors", "--caption_extension=.txt",
-            "--seed=42", "--no_half_vae", "--xformers",
+            "--seed=42", "--no_half_vae", "--sdpa",
         ]
         with open(log_path, "w") as lf:
             p = subprocess.run(cmd, cwd=KOHYA, stdout=lf, stderr=subprocess.STDOUT)
