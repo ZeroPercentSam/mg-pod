@@ -19,6 +19,10 @@ WS=/workspace
 CD="$WS/ComfyUI"
 mkdir -p "$WS"
 exec > >(tee -a "$WS/boot.log") 2>&1   # persist boot trace to the volume → readable live via /boot-log
+# Warm-boot fast path: every provisioning step below is guarded by a sentinel on the volume, so a 2nd+
+# boot skips straight to starting ComfyUI (~2min). Set REPROVISION=1 to force a clean re-provision
+# (e.g. after bumping ComfyUI/nodes) without wiping the whole volume.
+[ "${REPROVISION:-}" = "1" ] && { echo "[boot] REPROVISION=1 → clearing sentinels"; rm -f "$WS"/.deps-comfy "$WS"/.deps-vhs "$WS"/.kohya-v2 "$WS"/.provisioned; }
 
 # --- auth-proxy: :8188 (Bearer-gated) → ComfyUI :8189, plus local /train + /boot-log endpoints ---
 cat > /authproxy.py <<'PY'
@@ -247,8 +251,10 @@ if [ ! -d "$CD" ]; then
   echo "[boot] cloning ComfyUI"
   git clone --depth=1 https://github.com/comfyanonymous/ComfyUI "$CD" || echo "[boot] WARN ComfyUI clone"
 fi
-echo "[boot] ensuring ComfyUI deps"
-python3 -m pip install -q -r "$CD/requirements.txt" || echo "[boot] WARN ComfyUI deps"
+if [ ! -f "$WS/.deps-comfy" ]; then
+  echo "[boot] installing ComfyUI deps"
+  python3 -m pip install -q -r "$CD/requirements.txt" && touch "$WS/.deps-comfy" || echo "[boot] WARN ComfyUI deps (retry next boot)"
+fi
 
 # --- base models: download whenever a URL is set (idempotent; needed for generation even in MINIMAL) ---
 M="$CD/models"
@@ -274,9 +280,10 @@ CN="$CD/custom_nodes"; mkdir -p "$CN"
 #     imageio-ffmpeg (pulled by VHS requirements) — no apt ffmpeg (apt update can hang the boot). ---
 VHS="$CN/ComfyUI-VideoHelperSuite"
 [ -d "$VHS" ] || git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite "$VHS"
-echo "[boot] ensuring VideoHelperSuite deps"
-[ -f "$VHS/requirements.txt" ] && python3 -m pip install -q -r "$VHS/requirements.txt" || true
-python3 -m pip install -q imageio-ffmpeg || echo "[boot] WARN imageio-ffmpeg"
+if [ ! -f "$WS/.deps-vhs" ]; then
+  echo "[boot] installing VideoHelperSuite deps"
+  python3 -m pip install -q -r "$VHS/requirements.txt" && python3 -m pip install -q imageio-ffmpeg && touch "$WS/.deps-vhs" || echo "[boot] WARN VHS deps (retry next boot)"
+fi
 
 # --- optional heavy nodes (face-swap / controlnet / upscale / etc.): first full boot only. Not used by
 #     any current template, so their import failures are harmless noise — kept for future work. ---
