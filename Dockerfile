@@ -26,7 +26,7 @@ RUN git clone --depth=1 https://github.com/kohya-ss/sd-scripts /opt/sd-scripts \
  && python3 -m venv /opt/kohya-venv \
  && /opt/kohya-venv/bin/pip install --upgrade pip \
  && /opt/kohya-venv/bin/pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124 \
- && /opt/kohya-venv/bin/pip install -r /opt/sd-scripts/requirements.txt accelerate \
+ && cd /opt/sd-scripts && /opt/kohya-venv/bin/pip install -r requirements.txt accelerate \
  && /opt/kohya-venv/bin/python -c "import torch; from transformers import CLIPTextModel; print('kohya env OK')"
 
 COPY authproxy.py /opt/authproxy.py

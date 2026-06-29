@@ -315,7 +315,8 @@ if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.kohya-v2" ]; then
   PIP="$WS/kohya-venv/bin/pip"
   "$PIP" install --upgrade pip
   "$PIP" install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124 || echo "[boot] WARN torch"
-  "$PIP" install -r "$WS/sd-scripts/requirements.txt" || echo "[boot] WARN kohya reqs"
+  # cd so the trailing `.` in requirements.txt (installs the local kohya `library` pkg) resolves
+  (cd "$WS/sd-scripts" && "$PIP" install -r requirements.txt) || echo "[boot] WARN kohya reqs"
   "$PIP" install accelerate || echo "[boot] WARN accelerate"
   # Smoke-test the exact import that failed before; only flag provisioned if it passes (else retry).
   if "$WS/kohya-venv/bin/python" -c "import torch; from transformers import CLIPTextModel" 2>>"$WS/boot.log"; then
