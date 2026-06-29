@@ -74,7 +74,7 @@ fi
 
 # --- auth-proxy: :8188 (Bearer-gated) → ComfyUI :8189, plus a local /train endpoint (kohya) ---
 cat > /authproxy.py <<'PY'
-import os, json, time, threading, subprocess, shutil, traceback, urllib.request, urllib.error, http.server
+import os, re, json, time, threading, subprocess, shutil, traceback, urllib.request, urllib.error, http.server
 from urllib.parse import urlparse, parse_qs
 
 TOKEN = os.environ.get("COMFYUI_TOKEN", "")
@@ -127,8 +127,10 @@ def _run_training(job_id, spec):
         repeats = int(spec.get("repeats", 10))
         images = spec["images"]
         captions = spec.get("captions") or []
+        # token is free-text from the app's trigger-word field → sanitize before it becomes a path component
+        token_dir = re.sub(r"[^A-Za-z0-9 _-]", "", token).strip() or "sks"
         root = f"{WS}/train/{job_id}"
-        img_dir = f"{root}/img/{repeats}_{token}"
+        img_dir = f"{root}/img/{repeats}_{token_dir}"
         shutil.rmtree(root, ignore_errors=True)
         os.makedirs(img_dir, exist_ok=True)
         os.makedirs(LORA_DIR, exist_ok=True)
