@@ -3,100 +3,24 @@
 #   bash -lc "curl -fsSL $COMFY_BOOT_URL | bash"
 # Brings ComfyUI up on 127.0.0.1:8189 behind a tiny Python auth-proxy on :8188 that requires
 # `Authorization: Bearer $COMFYUI_TOKEN`. Pure stdlib proxy (no caddy download to stall on).
-# The proxy also serves a /train endpoint (LoRA training via kohya sd-scripts) — see below.
+# The proxy also serves /train (LoRA training via kohya sd-scripts) + /boot-log (provisioning trace).
 # Secrets come from pod env (COMFYUI_TOKEN, HF_TOKEN, model URLs) — none baked in.
-# NOTE: the proxy forwards HTTP only (fire-and-poll). ComfyUI WS progress is not proxied (the app
-# polls /history, so this is fine); add a WS-capable proxy later if live progress is wanted.
-# Not using `set -e`: the proxy must come up even if a provisioning step fails, so the pod is
-# always reachable + gated and failures are observable via the API.
+#
+# The auth-proxy starts FIRST, then provisioning + ComfyUI run after it — so /boot-log and /train/status
+# are reachable from t=0 and a long (20–40min) first boot is observable instead of a blind black box.
+# ComfyUI :8189 isn't up until provisioning finishes, so /system_stats 502s until then (expected).
+# python3 explicitly everywhere: this image ships python3 but bare `python` is not on PATH in the boot
+# context (using `python` silently broke venv creation + ComfyUI start on earlier boots).
+# Not using `set -e`: the proxy must stay up even if a provisioning step fails, so the pod is always
+# reachable + gated and failures are observable via the API.
 
 : "${COMFYUI_TOKEN:?COMFYUI_TOKEN required}"
 WS=/workspace
 CD="$WS/ComfyUI"
 mkdir -p "$WS"
-exec > >(tee -a "$WS/boot.log") 2>&1   # persist boot trace to the volume → readable post-mortem via /boot-log
+exec > >(tee -a "$WS/boot.log") 2>&1   # persist boot trace to the volume → readable live via /boot-log
 
-echo "[boot] tools"
-command -v git >/dev/null 2>&1 || (apt-get update -y && apt-get install -y --no-install-recommends git) >/dev/null 2>&1 || true
-
-# --- ComfyUI on the volume (persists across restarts) ---
-if [ ! -d "$CD" ]; then
-  echo "[boot] cloning ComfyUI"
-  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI "$CD" || echo "[boot] WARN ComfyUI clone"
-fi
-# Ensure deps every boot (cheap if satisfied) — the clone may have happened on a prior boot. python3
-# explicitly: this image ships python3 but bare `python` is not on PATH in the boot context.
-python3 -m pip install -q -r "$CD/requirements.txt" || echo "[boot] WARN ComfyUI deps"
-
-# --- base models: download whenever a URL is set (idempotent; needed for generation even in MINIMAL) ---
-M="$CD/models"
-mkdir -p "$M"/{checkpoints,vae,loras,controlnet,upscale_models,diffusion_models,text_encoders,clip_vision,instantid,pulid}
-dl() {
-  [ -z "${1:-}" ] && return 0
-  [ -f "$2" ] && return 0
-  echo "[boot] downloading $(basename "$2")"
-  if [ -n "${HF_TOKEN:-}" ]; then wget -q --header="Authorization: Bearer ${HF_TOKEN}" -O "$2" "$1" || { echo "[boot] WARN dl failed $2"; rm -f "$2"; }
-  else wget -q -O "$2" "$1" || { echo "[boot] WARN dl failed $2"; rm -f "$2"; }; fi
-}
-dl "${SDXL_CKPT_URL:-}"    "$M/checkpoints/sdxl-base.safetensors"
-dl "${FLUX_DEV_FP8_URL:-}" "$M/diffusion_models/flux1-dev-fp8.safetensors"
-dl "${FLUX_VAE_URL:-}"     "$M/vae/ae.safetensors"
-dl "${T5XXL_URL:-}"        "$M/text_encoders/t5xxl_fp16.safetensors"
-dl "${CLIP_L_URL:-}"       "$M/text_encoders/clip_l.safetensors"
-dl "${LTXV_CKPT_URL:-}"    "$M/checkpoints/ltx-video.safetensors"   # Phase 5 img2vid (needs T5XXL_URL too)
-
-CN="$CD/custom_nodes"; mkdir -p "$CN"
-# --- VideoHelperSuite: the ONLY custom node a built-in template needs (VHS_VideoCombine → mp4 for
-#     ltx-img2vid). Clone + ENSURE deps EVERY boot (python3 + ffmpeg) — a prior boot's broken bare-pip
-#     can leave node deps uninstalled, and the optional-node flag below would otherwise skip reinstall. ---
-VHS="$CN/ComfyUI-VideoHelperSuite"
-[ -d "$VHS" ] || git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite "$VHS"
-command -v ffmpeg >/dev/null 2>&1 || (apt-get update -y && apt-get install -y --no-install-recommends ffmpeg) >/dev/null 2>&1 || echo "[boot] WARN ffmpeg"
-[ -f "$VHS/requirements.txt" ] && python3 -m pip install -q -r "$VHS/requirements.txt" || true
-
-# --- optional heavy nodes (face-swap / controlnet / upscale / etc.): first full boot only. Not used by
-#     any current template, so their import failures are harmless noise — kept for future work. ---
-if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.provisioned" ]; then
-  echo "[boot] provisioning optional custom nodes (first full boot — may take 5–20 min)"
-  clone() { d="$CN/$(basename "$1")"; [ -d "$d" ] || git clone --depth=1 "$1" "$d"; [ -f "$d/requirements.txt" ] && python3 -m pip install -q -r "$d/requirements.txt" || true; }
-  clone https://github.com/ltdrdata/ComfyUI-Manager
-  clone https://github.com/ltdrdata/ComfyUI-Impact-Pack
-  clone https://github.com/cubiq/ComfyUI_IPAdapter_plus
-  clone https://github.com/cubiq/ComfyUI-InstantID
-  clone https://github.com/Gourieff/comfyui-reactor-node
-  clone https://github.com/cubiq/PuLID_ComfyUI
-  clone https://github.com/Fannovel16/comfyui_controlnet_aux
-  clone https://github.com/kijai/ComfyUI-FluxTrainer
-  clone https://github.com/ssitu/ComfyUI_UltimateSDUpscale
-  clone https://github.com/kijai/ComfyUI-WanVideoWrapper
-  touch "$WS/.provisioned"
-fi
-
-# --- kohya sd-scripts for SDXL LoRA training (full boot only; venv isolates kohya's pinned deps
-#     from ComfyUI's env so neither breaks the other). Persists on the volume → one-time cost. ---
-# CLEAN, self-contained venv (NOT --system-site-packages): the system-site hybrid made the venv load
-# the base transformers against a mismatched torch → "Could not import CLIPTextModel". A clean venv with
-# a pinned torch (cu124, matching the image) installs a consistent transformers/diffusers set. Sentinel
-# .kohya-v2 forces a one-time rebuild over any earlier broken venv (which still has an accelerate binary).
-if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.kohya-v2" ]; then
-  echo "[boot] provisioning kohya sd-scripts (clean venv v2 — downloads torch, a few min)"
-  [ -d "$WS/sd-scripts" ] || git clone --depth=1 https://github.com/kohya-ss/sd-scripts "$WS/sd-scripts"
-  rm -rf "$WS/kohya-venv"
-  python3 -m venv "$WS/kohya-venv" || echo "[boot] WARN venv create failed"
-  PIP="$WS/kohya-venv/bin/pip"
-  "$PIP" install --upgrade pip
-  "$PIP" install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124 || echo "[boot] WARN torch"
-  "$PIP" install -r "$WS/sd-scripts/requirements.txt" || echo "[boot] WARN kohya reqs"
-  "$PIP" install accelerate || echo "[boot] WARN accelerate"
-  # Smoke-test the exact import that failed before; only flag provisioned if it passes (else retry).
-  if "$WS/kohya-venv/bin/python" -c "import torch; from transformers import CLIPTextModel" 2>>"$WS/boot.log"; then
-    echo "[boot] kohya env OK"; touch "$WS/.kohya-v2"
-  else
-    echo "[boot] WARN kohya env import FAILED — will retry next boot"
-  fi
-fi
-
-# --- auth-proxy: :8188 (Bearer-gated) → ComfyUI :8189, plus a local /train endpoint (kohya) ---
+# --- auth-proxy: :8188 (Bearer-gated) → ComfyUI :8189, plus local /train + /boot-log endpoints ---
 cat > /authproxy.py <<'PY'
 import os, re, json, time, threading, subprocess, shutil, traceback, urllib.request, urllib.error, http.server
 from urllib.parse import urlparse, parse_qs
@@ -255,7 +179,7 @@ class H(http.server.BaseHTTPRequestHandler):
         if not spec.get("images") or not spec.get("output_name"):
             return self._json(400, {"error": "images[] and output_name required"})
         if not os.path.exists(ACCEL):
-            return self._json(503, {"error": "trainer not provisioned on this pod (boot with COMFY_MINIMAL unset, then restart)"})
+            return self._json(503, {"error": "trainer not provisioned yet (still booting, or boot with COMFY_MINIMAL unset)"})
         job_id = spec.get("job_id") or f"job-{int(time.time())}"
         with jobs_lock:
             busy = [j for j, v in jobs.items() if v.get("status") in ("queued", "downloading", "training")]
@@ -312,9 +236,89 @@ class H(http.server.BaseHTTPRequestHandler):
 _load_jobs()
 http.server.ThreadingHTTPServer(("0.0.0.0", 8188), H).serve_forever()
 PY
+python3 /authproxy.py &
+echo "[boot] auth-proxy up on :8188 (provisioning below — watch GET /boot-log)"
+
+echo "[boot] tools"
+command -v git >/dev/null 2>&1 || (apt-get update -y && apt-get install -y --no-install-recommends git) >/dev/null 2>&1 || true
+
+# --- ComfyUI on the volume (persists across restarts) ---
+if [ ! -d "$CD" ]; then
+  echo "[boot] cloning ComfyUI"
+  git clone --depth=1 https://github.com/comfyanonymous/ComfyUI "$CD" || echo "[boot] WARN ComfyUI clone"
+fi
+echo "[boot] ensuring ComfyUI deps"
+python3 -m pip install -q -r "$CD/requirements.txt" || echo "[boot] WARN ComfyUI deps"
+
+# --- base models: download whenever a URL is set (idempotent; needed for generation even in MINIMAL) ---
+M="$CD/models"
+mkdir -p "$M"/{checkpoints,vae,loras,controlnet,upscale_models,diffusion_models,text_encoders,clip_vision,instantid,pulid}
+dl() {
+  [ -z "${1:-}" ] && return 0
+  [ -f "$2" ] && return 0
+  echo "[boot] downloading $(basename "$2")"
+  if [ -n "${HF_TOKEN:-}" ]; then wget -q --header="Authorization: Bearer ${HF_TOKEN}" -O "$2" "$1" || { echo "[boot] WARN dl failed $2"; rm -f "$2"; }
+  else wget -q -O "$2" "$1" || { echo "[boot] WARN dl failed $2"; rm -f "$2"; }; fi
+}
+dl "${SDXL_CKPT_URL:-}"    "$M/checkpoints/sdxl-base.safetensors"
+dl "${FLUX_DEV_FP8_URL:-}" "$M/diffusion_models/flux1-dev-fp8.safetensors"
+dl "${FLUX_VAE_URL:-}"     "$M/vae/ae.safetensors"
+dl "${T5XXL_URL:-}"        "$M/text_encoders/t5xxl_fp16.safetensors"
+dl "${CLIP_L_URL:-}"       "$M/text_encoders/clip_l.safetensors"
+dl "${LTXV_CKPT_URL:-}"    "$M/checkpoints/ltx-video.safetensors"   # Phase 5 img2vid (needs T5XXL_URL too)
+
+CN="$CD/custom_nodes"; mkdir -p "$CN"
+# --- VideoHelperSuite: the ONLY custom node a built-in template needs (VHS_VideoCombine → mp4 for
+#     ltx-img2vid). Clone + ENSURE deps EVERY boot (python3) — a prior boot's broken bare-pip can leave
+#     node deps uninstalled, and the optional-node flag below would otherwise skip reinstall. mp4 uses
+#     imageio-ffmpeg (pulled by VHS requirements) — no apt ffmpeg (apt update can hang the boot). ---
+VHS="$CN/ComfyUI-VideoHelperSuite"
+[ -d "$VHS" ] || git clone --depth=1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite "$VHS"
+echo "[boot] ensuring VideoHelperSuite deps"
+[ -f "$VHS/requirements.txt" ] && python3 -m pip install -q -r "$VHS/requirements.txt" || true
+python3 -m pip install -q imageio-ffmpeg || echo "[boot] WARN imageio-ffmpeg"
+
+# --- optional heavy nodes (face-swap / controlnet / upscale / etc.): first full boot only. Not used by
+#     any current template, so their import failures are harmless noise — kept for future work. ---
+if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.provisioned" ]; then
+  echo "[boot] provisioning optional custom nodes (first full boot — may take 5–20 min)"
+  clone() { d="$CN/$(basename "$1")"; [ -d "$d" ] || git clone --depth=1 "$1" "$d"; [ -f "$d/requirements.txt" ] && python3 -m pip install -q -r "$d/requirements.txt" || true; }
+  clone https://github.com/ltdrdata/ComfyUI-Manager
+  clone https://github.com/ltdrdata/ComfyUI-Impact-Pack
+  clone https://github.com/cubiq/ComfyUI_IPAdapter_plus
+  clone https://github.com/cubiq/ComfyUI-InstantID
+  clone https://github.com/Gourieff/comfyui-reactor-node
+  clone https://github.com/cubiq/PuLID_ComfyUI
+  clone https://github.com/Fannovel16/comfyui_controlnet_aux
+  clone https://github.com/kijai/ComfyUI-FluxTrainer
+  clone https://github.com/ssitu/ComfyUI_UltimateSDUpscale
+  clone https://github.com/kijai/ComfyUI-WanVideoWrapper
+  touch "$WS/.provisioned"
+fi
+
+# --- kohya sd-scripts for SDXL LoRA training (full boot only). CLEAN self-contained venv (NOT
+#     --system-site-packages): the system-site hybrid made the venv load the base transformers against a
+#     mismatched torch → "Could not import CLIPTextModel". Clean venv + pinned cu124 torch fixes it.
+#     Sentinel .kohya-v2 forces a one-time rebuild over any earlier broken venv. ---
+if [ "${MINIMAL:-0}" != "1" ] && [ ! -f "$WS/.kohya-v2" ]; then
+  echo "[boot] provisioning kohya sd-scripts (clean venv v2 — downloads torch, a few min)"
+  [ -d "$WS/sd-scripts" ] || git clone --depth=1 https://github.com/kohya-ss/sd-scripts "$WS/sd-scripts"
+  rm -rf "$WS/kohya-venv"
+  python3 -m venv "$WS/kohya-venv" || echo "[boot] WARN venv create failed"
+  PIP="$WS/kohya-venv/bin/pip"
+  "$PIP" install --upgrade pip
+  "$PIP" install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124 || echo "[boot] WARN torch"
+  "$PIP" install -r "$WS/sd-scripts/requirements.txt" || echo "[boot] WARN kohya reqs"
+  "$PIP" install accelerate || echo "[boot] WARN accelerate"
+  # Smoke-test the exact import that failed before; only flag provisioned if it passes (else retry).
+  if "$WS/kohya-venv/bin/python" -c "import torch; from transformers import CLIPTextModel" 2>>"$WS/boot.log"; then
+    echo "[boot] kohya env OK"; touch "$WS/.kohya-v2"
+  else
+    echo "[boot] WARN kohya env import FAILED — will retry next boot"
+  fi
+fi
 
 echo "[boot] starting ComfyUI (127.0.0.1:8189)"
 cd "$CD" && python3 main.py --listen 127.0.0.1 --port 8189 >/comfy.log 2>&1 &
-for _ in $(seq 1 150); do curl -sf "http://127.0.0.1:8189/system_stats" >/dev/null 2>&1 && break; sleep 2; done
-echo "[boot] starting auth-proxy on :8188"
-exec python3 /authproxy.py
+echo "[boot] provisioning complete; ComfyUI starting. Pod ready once /system_stats returns 200."
+wait   # keep the container alive on the auth-proxy (+ ComfyUI) background jobs
